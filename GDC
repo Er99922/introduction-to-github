@@ -1,0 +1,300 @@
+import json
+import requests
+import pymysql
+from collections import defaultdict
+from typing import Dict
+from decimal import Decimal
+
+# Elasticsearch connection details
+ES_HOST = "http://10.73.247.9:9200"  # Ganti dengan host Elasticsearch Anda
+INDEX_NAME = "log-router-acquirer"
+tanggal = "2025-01-01"  # Ganti dengan tanggal yang ingin diproses
+
+# Konfigurasi database
+DB_CONFIG: Dict[str, str] = {
+    'host': '127.0.0.1',
+    'user': 'gdcprod',
+    'password': 'super@gdc2018',
+    'port': 13307 
+}
+
+# Daftar responseCode yang ingin diambil
+ALLOWED_RESPONSE_CODES = ["00", "05", "14", "68", "57", "03", "30", "76"]
+
+# Query Elasticsearch menggunakan scroll API
+def query_elasticsearch():
+    url = f"{ES_HOST}/{INDEX_NAME}/_search?scroll=1m"  # Waktu scroll 1 menit
+
+    query = {
+        "query": {
+            "bool": {
+                "must": [
+                    {
+                        "term": {
+                            "path.keyword": "/qr/payment"
+                        }
+                    },
+                    {
+                        "range": {
+                            "@timestamp": {
+                                "from": f'{tanggal}T00:00:00.000+07:00',
+                                "to": f'{tanggal}T23:59:59.999+07:00'
+                            }
+                        }
+                    }
+                ]
+            }
+        },
+        "size": 1000  # Ambil 1000 dokumen per batch
+    }
+
+    try:
+        # Kirim permintaan pertama untuk mengambil batch pertama dari data
+        print("Mengirim permintaan pertama ke Elasticsearch...")
+        response = requests.post(url, headers={"Content-Type": "application/json"}, data=json.dumps(query))
+        response.raise_for_status()
+
+        # Ambil scroll ID dari response pertama
+        scroll_id = response.json()['_scroll_id']
+        hits = response.json().get('hits', {}).get('hits', [])
+        
+        all_hits = hits  # Menyimpan semua hasil
+        total_hits = len(hits)
+        print(f"Batch pertama diterima. Jumlah hasil: {total_hits} dokumen.")
+
+        # Loop untuk mengambil hasil batch berikutnya
+        batch_count = 2  # Dimulai dari batch ke-2
+        while hits:
+            scroll_url = f"{ES_HOST}/_search/scroll"
+            scroll_query = {
+                "scroll": "1m",  # Tentukan durasi scroll
+                "scroll_id": scroll_id
+            }
+
+            scroll_response = requests.post(scroll_url, headers={"Content-Type": "application/json"}, data=json.dumps(scroll_query))
+            scroll_response.raise_for_status()
+
+            # Ambil batch berikutnya dari data
+            hits = scroll_response.json().get('hits', {}).get('hits', [])
+            scroll_id = scroll_response.json()['_scroll_id']
+            
+            # Tambahkan hasil baru ke semua hits yang sudah ada
+            all_hits.extend(hits)
+            total_hits += len(hits)
+
+            print(f"Batch {batch_count} diterima. Jumlah hasil: {len(hits)} dokumen. Total hasil sejauh ini: {total_hits} dokumen.")
+            batch_count += 1
+
+        if not all_hits:
+            print("Tidak ada data ditemukan.")
+            return {}
+
+        print("Proses pencarian selesai. Total hasil ditemukan:", total_hits)
+
+        # Mengambil merchantId, responseCode, transactionAmount dari semua hits
+        grouped_data = defaultdict(lambda: defaultdict(int))  # Nested dictionary untuk responseCode dan partner_id_aggregator
+        total_amount_for_00 = 0  # Total amount khusus untuk responseCode 00
+        merchant_ids = set()  # Untuk menyimpan merchantIds yang akan dicari partner_id_aggregator
+
+        for hit in all_hits:
+            if hit["_source"].get("path", "") == "/qr/payment":
+                # Mengambil merchantId, responseCode dan transactionAmount
+                merchant_id = hit["_source"].get("request_body_obj", {}).get("merchantId", "").strip()
+                response_code = hit["_source"].get("response_body_obj", {}).get("responseCode", "").strip()
+                transaction_amount = hit["_source"].get("request_body_obj", {}).get("transactionAmount", 0)
+
+                # Memastikan responseCode ada dalam daftar yang diizinkan
+                if merchant_id and response_code in ALLOWED_RESPONSE_CODES:
+                    grouped_data[response_code][merchant_id] += 1
+                    merchant_ids.add(merchant_id)
+
+                    # Hanya menambahkan ke total_amount_for_00 jika responseCode adalah "00"
+                    if response_code == "00":
+                        total_amount_for_00 += transaction_amount
+
+        # Menampilkan hasil dalam format yang diminta
+        print("\nDate: "+tanggal)
+        print(f"Total Transactions: {total_hits}")
+        
+        # Tampilkan hanya total amount untuk responseCode "00"
+        if total_amount_for_00 > 0:
+            print(f"Total Amount: {total_amount_for_00}")
+        print("----------------------------------------")
+
+        # Langkah 2: Cari partner_id_aggregator berdasarkan merchantId di database
+        partner_id_aggregators = get_partner_id_aggregator(merchant_ids)
+
+        # Langkah 3: Hitung kemunculan partner_id_aggregator untuk setiap responseCode
+        partner_id_counts = defaultdict(lambda: defaultdict(int))  # Nested dictionary untuk menghitung kemunculan per partner_id
+
+        # Mengelompokkan berdasarkan responseCode dan partner_id_aggregator
+        for response_code, partner_data in grouped_data.items():
+            for merchant_id, count in partner_data.items():
+                # Dapatkan partner_id_aggregator berdasarkan merchant_id
+                partner_ids_for_merchant = [pid['partner_id_aggregator'] for pid in partner_id_aggregators if pid['kd_merchant'] == merchant_id]
+                
+                for partner_id in partner_ids_for_merchant:
+                    partner_id_counts[response_code][partner_id] += count
+
+        # Menampilkan hasil dalam format yang diminta
+        for response_code, partner_data in partner_id_counts.items():
+            response_code_count = sum(partner_data.values())
+            print(f"  Response Code: {response_code}, Count: {response_code_count}")
+            for partner_id, count in partner_data.items():
+                print(f"       Partner id: {partner_id} ada {count}")
+            print("----------------------------------------")
+
+        return grouped_data
+
+    except requests.exceptions.RequestException as e:
+        print(f"Terjadi kesalahan saat melakukan request ke Elasticsearch: {e}")
+        return {}
+
+# Membuat koneksi ke database
+def create_db_connection(database):
+    return pymysql.connect(
+        host=DB_CONFIG['host'],
+        user=DB_CONFIG['user'],
+        password=DB_CONFIG['password'],
+        database=database,
+        port=DB_CONFIG['port'],
+        charset='utf8mb4',
+        cursorclass=pymysql.cursors.DictCursor
+    )
+
+# Mencari partner_id_aggregator berdasarkan merchantId di database
+def get_partner_id_aggregator(merchant_ids):
+    # Membuka koneksi ke database
+    try:
+        print("Mencari partner_id_aggregator di database untuk merchantIds...")
+        database_name='db_acquire'
+        connection = create_db_connection(database_name)
+        cursor = connection.cursor()
+
+        # Menyiapkan query untuk mencari partner_id_aggregator berdasarkan merchantId
+        query = """
+            SELECT kd_merchant, partner_id_aggregator
+            FROM detail_merchant 
+            WHERE kd_merchant IN (%s)
+        """
+        
+        # Membuat parameter string untuk query IN clause
+        format_strings = ','.join(['%s'] * len(merchant_ids))
+        query = query % format_strings
+
+        # Eksekusi query
+        cursor.execute(query, tuple(merchant_ids))
+        result = cursor.fetchall()
+
+        # Menutup cursor dan koneksi
+        cursor.close()
+        connection.close()
+        return result
+
+    except Exception as e:
+        print(f"Terjadi kesalahan saat melakukan query ke database: {e}")
+        return []
+
+
+def get_transaction_aggregation(tanggal: str):
+    try:
+        database_name = 'db_payment_gateway'
+        connection = create_db_connection(database_name)
+        cursor = connection.cursor()
+
+        # Query SQL untuk agregasi data transaksi
+        query = """
+            SELECT 
+                a.datanya, 
+                a.statusnya, 
+                a.partner_id, 
+                COUNT(1) as total, 
+                SUM(a.rp_transfer) as Nominal, 
+                DATE(tgl_transfer) AS Tanggal
+            FROM (
+                SELECT request_id, rp_transfer, 'sukses' AS statusnya, tgl_transfer, 'db_pg' as datanya, partner_id
+                FROM db_payment_gateway.log_sukses_transfer_bank lstb 
+                UNION ALL
+                SELECT request_id, rp_transfer, 'sukses' AS statusnya, tgl_transfer, 'db_pg' as datanya, partner_id
+                FROM db_payment_gateway.log_sukses_transfer_bank_backup lstbb 
+                UNION ALL
+                SELECT DISTINCT request_id, rp_transfer, 'pending' AS statusnya, tgl_transfer, 'db_pg' as datanya, partner_id
+                FROM db_payment_gateway.log_pending_transfer_bank lptb
+                UNION ALL
+                SELECT request_id, rp_transfer, 'gagal' AS statusnya, tgl_transfer, 'db_pg' as datanya, partner_id
+                FROM db_payment_gateway.log_gagal_transfer_bank lstb 
+                UNION ALL
+                SELECT request_id, rp_transfer, 'gagal' AS statusnya, tgl_transfer, 'db_pg' as datanya, partner_id
+                FROM db_payment_gateway.log_gagal_transfer_bank_backup lstbb 
+            ) AS a 
+            WHERE tgl_transfer LIKE %s
+            GROUP BY a.partner_id, a.datanya, a.statusnya
+        """
+        
+        # Eksekusi query dengan parameter tanggal
+        cursor.execute(query, (f'{tanggal}%',))
+        result = cursor.fetchall()
+
+        # Menutup cursor dan koneksi
+        cursor.close()
+        connection.close()
+
+        return result
+
+    except Exception as e:
+        print(f"Terjadi kesalahan saat melakukan query ke database: {e}")
+        return []
+
+def display_transaction_aggregation(tanggal: str):
+    try:
+        # Ambil hasil agregasi dari database
+        transactions = get_transaction_aggregation(tanggal)
+
+        if not transactions:
+            print("Tidak ada data transaksi ditemukan.")
+            return
+
+        print(f"\nAgregasi Transaksi untuk Tanggal: {tanggal}")
+        print("----------------------------------------")
+        for transaction in transactions:
+            print(f"Partner ID: {transaction['partner_id']}")
+            print(f"  Data: {transaction['datanya']}")
+            print(f"  Status: {transaction['statusnya']}")
+            print(f"  Total Transaksi: {transaction['total']}")
+            print(f"  Total Nominal: {transaction['Nominal']}")
+            print(f"  Tanggal: {transaction['Tanggal']}")
+            print("----------------------------------------")
+
+    except Exception as e:
+        print(f"Terjadi kesalahan saat menampilkan data transaksi: {e}")
+
+        partner_id = row['partner_id']
+        datanya = row['datanya']
+        statusnya = row['statusnya']
+        total = row['total']
+        nominal = row['Nominal']
+        tanggal_transaksi = row['Tanggal']
+
+        # Menampilkan data dalam format yang lebih mudah dibaca
+        print(f"Partner ID        : {partner_id}")
+        print(f"Data Sumber       : {datanya}")
+        print(f"Status Transaksi  : {statusnya}")
+        print(f"Jumlah Transaksi  : {total}")
+        print(f"Total Nominal     : Rp {nominal:,.2f}")  # Format nominal menjadi format uang
+        print(f"Tanggal           : {tanggal_transaksi}")
+        print("----------------------------------------")
+
+def main():
+    print("Proses dimulai...\n")
+    
+    # Langkah 1: Query Elasticsearch untuk mendapatkan merchantIds dan responseCodes
+    grouped_data = query_elasticsearch()
+    
+    if not grouped_data:
+        return
+
+    # Langkah 2: Lakukan query SQL untuk transaksi dan aggregasi data
+    display_transaction_aggregation(tanggal)
+
+if __name__ == "__main__":
+    main()
